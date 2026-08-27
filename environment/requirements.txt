@@ -1,0 +1,17 @@
+# Python dependencies for the base viewer (src/viewer/, scripts/).
+# Install into the project virtual environment: python -m venv .venv
+#   Windows:  .venv\Scripts\pip install -r environment\requirements.txt
+#   POSIX:    .venv/bin/pip install -r environment/requirements.txt
+
+numpy>=1.24
+plyfile>=1.0.3        # reading/writing 3D Gaussian Splatting .ply files
+vispy>=0.14           # GPU-accelerated 3D scene rendering (points/markers, orbit camera)
+PyQt5>=5.15           # vispy backend + native "open file" dialog
+Pillow>=10.0           # texture sampling in scripts/generate_sample_gaussian_ply.py
+
+pytest>=8.0           # test suite (tests/) -- dev-only, not needed to just run the app
+
+# Not yet pinned: torch, a full 3DGS training/rasterization stack, COLMAP
+# tooling, diffusion-editing libraries, evaluation metric libraries (lpips,
+# clip, etc.) -- add these once the corresponding pipeline (mesh-based /
+# diffusion-based / evaluation) is implemented.
