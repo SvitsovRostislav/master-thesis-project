@@ -259,3 +259,180 @@ class TestPickMode:
         # The "table" must be untouched.
         np.testing.assert_allclose(panel.vertices[[0, 1, 2]], original_table)
         assert len(received_edits) == 1
+
+
+class TestSelectionMoveAllowed:
+    """The owner may refuse a move of the selection; the press then does what it does elsewhere."""
+
+    def _panel(self, allowed):
+        panel = MeshEditorPanel(selection_move_allowed=allowed)
+        panel.load_mesh(*_make_two_disconnected_triangles())
+        panel.set_mode("pick")
+        return panel
+
+    def test_a_refused_move_leaves_every_vertex_and_the_press_picks_instead(self, qapp):
+        picks = []
+        panel = self._panel(lambda: False)
+        panel.pick_resolver = lambda vertex: picks.append(vertex) or None
+        screen_verts = panel._project_to_canvas(panel.vertices)
+        panel._pick_press(_FakeEvent(screen_verts[3]))
+        original = panel.vertices.copy()
+
+        panel._pick_press(_FakeEvent(screen_verts[4], button=1, buttons=(1,)))
+        panel._select_move(_FakeEvent(screen_verts[4] + [20.0, 15.0], buttons=(1,)))
+
+        assert panel._select_drag_kind != "move"
+        assert np.array_equal(panel.vertices, original)
+        assert len(picks) == 2  # the second press was a pick, not a move
+
+    def test_an_allowed_move_moves_the_selection(self, qapp):
+        calls = []
+        panel = self._panel(lambda: calls.append(1) or True)
+        screen_verts = panel._project_to_canvas(panel.vertices)
+        panel._pick_press(_FakeEvent(screen_verts[3]))
+        original = panel.vertices.copy()
+
+        panel._pick_press(_FakeEvent(screen_verts[4], button=1, buttons=(1,)))
+        panel._select_move(_FakeEvent(screen_verts[4] + [20.0, 15.0], buttons=(1,)))
+
+        assert calls == [1]
+        assert np.nonzero(np.any(panel.vertices != original, axis=1))[0].tolist() == [3, 4, 5]
+
+    def test_the_move_takes_the_selection_the_callback_leaves(self, qapp):
+        def allowed():
+            panel.set_selection(np.array([3, 4]))  # what a cut does: a new selection
+            return True
+
+        panel = self._panel(allowed)
+        screen_verts = panel._project_to_canvas(panel.vertices)
+        panel._pick_press(_FakeEvent(screen_verts[3]))
+        original = panel.vertices.copy()
+
+        panel._pick_press(_FakeEvent(screen_verts[4], button=1, buttons=(1,)))
+        panel._select_move(_FakeEvent(screen_verts[4] + [20.0, 15.0], buttons=(1,)))
+
+        assert np.nonzero(np.any(panel.vertices != original, axis=1))[0].tolist() == [3, 4]
+
+    def test_a_callback_that_leaves_no_selection_starts_no_move(self, qapp):
+        panel = self._panel(None)
+        panel.selection_move_allowed = lambda: panel.set_selection(None) or True
+        screen_verts = panel._project_to_canvas(panel.vertices)
+        panel._pick_press(_FakeEvent(screen_verts[3]))
+
+        panel._pick_press(_FakeEvent(screen_verts[4], button=1, buttons=(1,)))
+
+        assert panel._select_drag_kind != "move"
+
+    def test_it_is_not_asked_for_a_press_away_from_the_selection(self, qapp):
+        calls = []
+        panel = self._panel(lambda: calls.append(1) or True)
+        screen_verts = panel._project_to_canvas(panel.vertices)
+
+        panel._pick_press(_FakeEvent(screen_verts[3]))  # a pick: nothing was selected yet
+        panel.set_mode("select")
+        far = _FakeEvent(screen_verts[3] + 10_000)  # a rectangle, far from the selection
+        far.modifiers = ()
+        panel._select_press(far)
+
+        assert calls == []
+
+
+class TestEditFinishedCallback:
+    """on_edit_finished fires once when a geometry-changing drag ends -- the
+    hook the "Adapt Gaussians" toggle relies on -- and never for a drag that
+    only draws a selection shape."""
+
+    def test_sculpt_drag_fires_it_once_on_release_not_per_move(self, qapp):
+        calls = []
+        panel = MeshEditorPanel(on_edit_finished=lambda: calls.append(1))
+        panel.load_mesh(*_make_pyramid())
+        panel.set_mode("sculpt")
+        screen_verts = panel._project_to_canvas(panel.vertices)
+
+        panel._sculpt_press(_FakeEvent(screen_verts[4]))
+        panel._sculpt_move(_FakeEvent(screen_verts[4] + [10.0, 5.0], buttons=(1,)))
+        panel._sculpt_move(_FakeEvent(screen_verts[4] + [20.0, 9.0], buttons=(1,)))
+        assert calls == []  # nothing mid-drag
+
+        panel._sculpt_release()
+        assert calls == [1]
+
+    def test_sculpt_click_that_misses_every_vertex_does_not_fire_it(self, qapp):
+        calls = []
+        panel = MeshEditorPanel(on_edit_finished=lambda: calls.append(1))
+        panel.load_mesh(*_make_pyramid())
+        panel.set_mode("sculpt")
+        screen_verts = panel._project_to_canvas(panel.vertices)
+
+        panel._sculpt_press(_FakeEvent(screen_verts[4] + 10_000))
+        panel._sculpt_release()
+
+        assert calls == []
+
+    def test_it_fires_before_on_sculpt_finished(self, qapp):
+        order = []
+        panel = MeshEditorPanel(
+            on_edit_finished=lambda: order.append("edit"),
+            on_sculpt_finished=lambda: order.append("sculpt"),
+        )
+        panel.load_mesh(*_make_pyramid())
+        panel.set_mode("sculpt")
+        screen_verts = panel._project_to_canvas(panel.vertices)
+
+        panel._sculpt_press(_FakeEvent(screen_verts[4]))
+        panel._sculpt_release()
+
+        assert order == ["edit", "sculpt"]
+
+    def test_moving_a_selection_fires_it_but_drawing_one_does_not(self, qapp):
+        calls = []
+        panel = MeshEditorPanel(on_edit_finished=lambda: calls.append(1))
+        panel.load_mesh(*_make_two_disconnected_triangles())
+        panel.set_mode("pick")
+        screen_verts = panel._project_to_canvas(panel.vertices)
+
+        panel._pick_press(_FakeEvent(screen_verts[3]))  # selects the component
+        panel._select_release()
+        assert calls == []  # selecting alone changes no geometry
+
+        panel._pick_press(_FakeEvent(screen_verts[3], button=1, buttons=(1,)))  # starts a move
+        panel._select_move(_FakeEvent(screen_verts[3] + [20.0, 15.0], buttons=(1,)))
+        panel._select_release()
+        assert calls == [1]
+
+
+class _KeyEvent(_FakeEvent):
+    def __init__(self, pos, modifiers=()):
+        super().__init__(pos)
+        self.modifiers = modifiers
+
+
+class TestPickModifiers:
+    def _panel(self):
+        panel = MeshEditorPanel()
+        panel.load_mesh(*_make_two_disconnected_triangles())
+        panel.set_mode("pick")
+        return panel, panel._project_to_canvas(panel.vertices)
+
+    def test_the_panel_records_the_modifier_keys_held_at_a_pick_click(self, qapp):
+        panel, screen = self._panel()
+        held = ("shift-key",)
+
+        panel._pick_press(_KeyEvent(screen[0], modifiers=held))
+
+        assert panel.pick_modifiers == held
+
+    def test_a_later_click_without_modifiers_forgets_them(self, qapp):
+        panel, screen = self._panel()
+        panel._pick_press(_KeyEvent(screen[0], modifiers=("shift-key",)))
+
+        panel._pick_press(_KeyEvent(screen[3]))
+
+        assert panel.pick_modifiers == ()
+
+    def test_the_pick_itself_is_unchanged_by_modifiers(self, qapp):
+        panel, screen = self._panel()
+
+        panel._pick_press(_KeyEvent(screen[4], modifiers=("shift-key", "control-key")))
+
+        assert sorted(panel.selected_vertices.tolist()) == [3, 4, 5]

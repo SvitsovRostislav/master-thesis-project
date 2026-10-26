@@ -1,19 +1,5 @@
-"""Convert a SuGaR refined checkpoint into a lightweight digital-twin package.
-
-Run this once (in the gs-train environment -- it needs torch/SuGaR to open
-the checkpoint) after train_full_pipeline.py finishes. The output .npz needs
-no torch/CUDA to load afterwards -- see src/viewer/digital_twin.py, which
-the plain viewer .venv uses to display and live-edit the result.
-
-Usage (from repo root, gs-train env with SuGaR importable):
-    D:\\conda-envs\\gs-train\\python.exe scripts\\export_digital_twin_package.py ^
-        --scene-path data\\raw\\mipnerf360_bonsai ^
-        --gs-output-dir data\\gaussian_scenes\\bonsai_baseline ^
-        --refined-checkpoint external\\SuGaR\\output\\refined\\mipnerf360_bonsai\\<run>\\<iter>.pt ^
-        --out data\\gaussian_scenes\\bonsai_digital_twin.npz
-"""
-
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -27,23 +13,13 @@ sys.path.insert(0, str(SUGAR_ROOT))
 
 from src.viewer.digital_twin import DigitalTwinPackage, save_digital_twin_package  # noqa: E402
 from src.viewer.gaussian_ply_io import SH_C0  # noqa: E402
+from src.viewer.twin_provenance import with_counts  # noqa: E402
 
 from sugar_scene.gs_model import GaussianSplattingWrapper  # noqa: E402
 from sugar_scene.sugar_model import load_refined_model  # noqa: E402
 
 
 def build_gaussian_face_bindings(n_faces: int, bary_coords: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten SuGaR's per-face barycentric pattern into per-Gaussian arrays.
-
-    `bary_coords` has shape (n_gaussians_per_face, 3, 1): one fixed
-    barycentric pattern, identical for every face (SugarModel.points
-    broadcasts it across faces via `[None]`, it does not carry a per-face
-    dimension itself). Flattening it here (once, at export time) means the
-    viewer doesn't need to know about that tiling convention at all -- just
-    a flat (face_idx, bary) pair per Gaussian, in the same
-    face-major/gaussian-minor order as `SugarModel.points`'s
-    `.reshape(n_faces * n_gaussians_per_face, 3)`.
-    """
     n_gaussians_per_face = bary_coords.shape[0]
     face_idx = np.repeat(np.arange(n_faces, dtype=np.int32), n_gaussians_per_face)
     bary = np.tile(bary_coords[:, :, 0], (n_faces, 1))  # pattern is identical per face
@@ -57,6 +33,7 @@ def main() -> None:
     parser.add_argument("--refined-checkpoint", required=True, help="Path to SuGaR's refined .pt checkpoint")
     parser.add_argument("--iteration-to-load", type=int, default=30000)
     parser.add_argument("--out", required=True, help="Output .npz path")
+    parser.add_argument("--provenance", default=None, help="JSON build record (twin_provenance.build_record) to store in the package")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,6 +81,10 @@ def main() -> None:
         gaussian_opacities=gaussian_opacities,
         gaussian_scales=gaussian_scales,
         gaussian_quaternions=gaussian_quaternions,
+        provenance=(
+            with_counts(json.loads(Path(args.provenance).read_text(encoding="utf-8")), mesh_vertices.shape[0], n_faces, n_gaussians)
+            if args.provenance else None
+        ),
     )
     save_digital_twin_package(args.out, package)
     print(f"Saved digital-twin package to {args.out}")

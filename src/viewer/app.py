@@ -1,16 +1,7 @@
-"""Interactive base viewer for 3D Gaussian Splatting scenes.
-
-Lets the user pick a .ply file (a real trained 3DGS scene, or the synthetic
-sample produced by scripts/generate_sample_gaussian_ply.py) via an "Open
-File..." button in the toolbar, and inspect it with the mouse: left-drag to
-orbit, scroll to zoom, right-drag (or Shift+left-drag) to pan. Every Gaussian
-is drawn as a flat, isotropic point sprite sized/colored from its scale and
-degree-0 SH color -- see gaussian_ply_io.py for the format details and
-simplifications.
-"""
-
 import argparse
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,38 +9,33 @@ from PyQt5 import QtCore, QtWidgets
 from vispy import app as vispy_app
 from vispy import scene
 
-from .digital_twin import DigitalTwinPackage, load_digital_twin_package
-from .digital_twin_builder import DigitalTwinBuilder, digital_twin_cache_path, find_colmap_source
+from .digital_twin import DigitalTwinPackage, load_digital_twin_package, save_digital_twin_package
+from .digital_twin_builder import GS_TRAIN_PYTHON, DigitalTwinBuilder, digital_twin_cache_path, find_colmap_source
+from .gaussian_density import DensityBaseline, rebalance_density
+from .gaussian_deformation import DeformationBaseline, adapt_gaussians_to_deformation
 from .gaussian_ply_io import load_gaussian_ply, save_gaussian_ply
+from .mesh_detach import detach_selection, inside_faces, stretches_on_move
+from .mesh_fill import close_cut
 from .mesh_editor import MeshEditorPanel
+from .preview_render import PreviewDialog, PreviewRenderer, find_scene_source_for_twin
+from .sam_pick import DEFAULT_LEVEL, INCLUSIVE, LEVEL_NAMES, MAJORITY, ReferenceGeometry
+from .sam_pick_runner import SamPickRunner, sam_checkpoint_available
+from .semantic_segmentation import label_at_vertex, labels_to_vertex_selection, load_semantic_labels
+from .twin_mask_check import TwinMaskChecker, scene_has_masks
+from .twin_provenance import MASK_SHARE_WARNING, assess, describe, load_cached_check, save_cached_check
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Real trained scenes live in data/Test data/<object>/plys/*.ply once
-# present; data/raw/test_models/ (a synthetic placeholder .ply) is the
-# fallback for a fresh checkout that doesn't have real data yet.
 _TEST_DATA_DIR = REPO_ROOT / "data" / "Test data"
 DEFAULT_OPEN_DIR = _TEST_DATA_DIR if _TEST_DATA_DIR.is_dir() else REPO_ROOT / "data" / "raw" / "test_models"
 
-# Marker sizes are in screen pixels (vispy's 3D world-space marker scaling is
-# not reliable yet, see https://github.com/vispy/vispy/issues/2357). Instead
-# of a fixed empirical pixel constant, the world-to-pixel ratio is estimated
-# per scene from the canvas size and the point cloud's extent (see
-# `_marker_sizes`), since TurntableCamera.set_range() frames each scene's
-# extent to roughly fill the canvas regardless of the scene's absolute scale.
-MARKER_DIAMETER_IN_SCALES = 2.0  # splat pixel diameter, as a multiple of its mean world-space scale
+SAM_MODES = ("Replace", "Add", "Subtract", "Exclude")
+SAM_VOTES = ("Majority", "Auto", "Inclusive")
+SYNCED_CAMERA_PROPS = ("azimuth", "elevation", "roll", "scale_factor")
+
+MARKER_DIAMETER_IN_SCALES = 2.0
 MIN_MARKER_PX = 1.0
 MAX_MARKER_PX = 40.0
 
-# Real trained 3DGS scenes -- especially unbounded outdoor captures -- often
-# spread a long tail of Gaussians (distant background, sky, stray SfM points)
-# far beyond the densely reconstructed subject. E.g. in the Tanks & Temples
-# "train" scene at 7k iterations, 50% of Gaussians sit within a radius of
-# ~2.6 world units of the median center, but the 90th-percentile radius jumps
-# to ~21 and the exact max to ~180: framing the camera from the *exact*
-# bounding box would zoom out to fit that tail and shrink the actual subject
-# to a speck. Framing is instead based on this percentile of each Gaussian's
-# distance from the scene's median center, which stays close to the dense
-# core regardless of how far a minority of points are scattered.
 EXTENT_DISTANCE_PERCENTILE = 80.0
 
 CONTROLS_HELP = (
@@ -59,9 +45,8 @@ CONTROLS_HELP = (
 
 
 def pick_ply_file(initial_dir: Path) -> str | None:
-    """Show a native "open file" dialog and return the chosen path, or None."""
     if QtWidgets.QApplication.instance() is None:
-        QtWidgets.QApplication(sys.argv)  # PyQt5 requires a live QApplication before any dialog/widget
+        QtWidgets.QApplication(sys.argv)
     path, _ = QtWidgets.QFileDialog.getOpenFileName(
         None,
         "Select a Gaussian Splat / point cloud .ply file",
@@ -72,7 +57,6 @@ def pick_ply_file(initial_dir: Path) -> str | None:
 
 
 def pick_digital_twin_file(initial_dir: Path) -> str | None:
-    """Show a native "open file" dialog for a digital-twin .npz package."""
     if QtWidgets.QApplication.instance() is None:
         QtWidgets.QApplication(sys.argv)
     path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -85,7 +69,6 @@ def pick_digital_twin_file(initial_dir: Path) -> str | None:
 
 
 def pick_save_ply_path(initial_dir: Path) -> str | None:
-    """Show a native "save file" dialog for exporting a Gaussian Splat .ply."""
     if QtWidgets.QApplication.instance() is None:
         QtWidgets.QApplication(sys.argv)
     path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -98,15 +81,6 @@ def pick_save_ply_path(initial_dir: Path) -> str | None:
 
 
 class GaussianViewer:
-    """Owns the vispy canvas/camera/markers for one Gaussian Splat point cloud.
-
-    Rendering only -- no window chrome or file dialogs, so it can be embedded
-    in a Qt window (see MainWindow) or driven headlessly (see the offscreen
-    smoke tests). `on_open_requested` / `on_quit_requested` are optional
-    no-argument callbacks fired by the matching keyboard shortcuts (O / Esc),
-    so a host window can wire them to the same handlers as its own button.
-    """
-
     def __init__(self, on_open_requested=None, on_quit_requested=None):
         self.canvas = scene.SceneCanvas(
             keys="interactive", size=(1024, 720), bgcolor="#141414"
@@ -121,47 +95,47 @@ class GaussianViewer:
         self.canvas.events.key_press.connect(self._on_key_press)
 
     def load(self, ply_path: str) -> int:
-        """Load a .ply file, refresh the displayed point cloud, and return its splat count."""
         cloud = load_gaussian_ply(ply_path)
         count = self._display(cloud.positions, cloud.colors, cloud.opacities, cloud.scales)
         print(f"Loaded {count:,} splats from {ply_path}")
         return count
 
-    def load_from_package(self, package: DigitalTwinPackage) -> int:
-        """Display an in-memory Gaussian cloud from a digital-twin package."""
+    def load_from_package(self, package: DigitalTwinPackage, keep_view: bool = False) -> int:
+        """Display an in-memory Gaussian cloud from a digital-twin package. With `keep_view` the
+        camera stays where it is instead of being fitted to the cloud."""
         positions = package.recompute_gaussian_positions()
         count = self._display(
-            positions, package.gaussian_colors, package.gaussian_opacities, package.gaussian_scales
+            positions, package.gaussian_colors, package.gaussian_opacities, package.gaussian_scales, keep_view
         )
         print(f"Loaded {count:,} splats from digital-twin package")
         return count
 
     def update_positions(self, positions: np.ndarray) -> None:
-        """Refresh only Gaussian positions (color/opacity/size unchanged).
-
-        Used for live updates while dragging the linked mesh -- cheap enough
-        to call once per mouse-move event, and deliberately does not re-fit
-        the camera (that would be visually jarring mid-edit).
-        """
         self.markers.set_data(
             pos=positions, face_color=self._face_colors, size=self._sizes, edge_width=0
         )
 
     def _display(
-        self, positions: np.ndarray, colors: np.ndarray, opacities: np.ndarray, scales: np.ndarray
+        self,
+        positions: np.ndarray,
+        colors: np.ndarray,
+        opacities: np.ndarray,
+        scales: np.ndarray,
+        keep_view: bool = False,
     ) -> int:
         face_colors = np.concatenate([colors, opacities[:, None]], axis=1)  # RGBA
 
         self.markers.set_data(
             pos=positions,
             face_color=face_colors,
-            size=1.0,  # placeholder; real sizes are set below once the camera is fitted
+            size=1.0,
             edge_width=0,
         )
 
         center, radius = self._robust_center_and_radius(positions)
         lo, hi = center - radius, center + radius
-        self.view.camera.set_range(x=(lo[0], hi[0]), y=(lo[1], hi[1]), z=(lo[2], hi[2]))
+        if not keep_view:
+            self.view.camera.set_range(x=(lo[0], hi[0]), y=(lo[1], hi[1]), z=(lo[2], hi[2]))
 
         sizes = self._marker_sizes(radius, scales)
         self.markers.set_data(pos=positions, face_color=face_colors, size=sizes, edge_width=0)
@@ -172,22 +146,12 @@ class GaussianViewer:
 
     @staticmethod
     def _robust_center_and_radius(positions: np.ndarray) -> tuple[np.ndarray, float]:
-        """Median center and an outlier-robust framing radius (see note above)."""
         center = np.median(positions, axis=0)
         dist_from_center = np.linalg.norm(positions - center, axis=1)
         radius = float(np.percentile(dist_from_center, EXTENT_DISTANCE_PERCENTILE))
         return center, max(radius, 1e-6)
 
     def _marker_sizes(self, radius: float, scales: np.ndarray) -> np.ndarray:
-        """Convert each Gaussian's world-space scale into an on-screen pixel diameter.
-
-        Estimates the world-to-pixel ratio from the canvas height and the
-        framing radius used in `load()`, then sizes each splat to a small
-        multiple of its own mean scale. This is a simplification: real 3DGS
-        rendering draws an oriented, view-dependent 2D ellipse per Gaussian;
-        here every splat is an isotropic circular sprite of fixed pixel size
-        (see module docstring).
-        """
         canvas_height_px = self.canvas.size[1]
         px_per_world_unit = canvas_height_px / max(2.0 * radius, 1e-6)
 
@@ -203,15 +167,6 @@ class GaussianViewer:
 
 
 class BuildProgressDialog(QtWidgets.QDialog):
-    """Shows stage/progress/log while a DigitalTwinBuilder runs in the
-    background. Non-modal (see MainWindow._start_build) so the rest of the
-    app -- e.g. rotating the still-open Gaussian view -- stays usable while
-    it waits; "Cancel" kills the underlying subprocess, closing the window
-    via the titlebar does not (the build keeps running, just unobserved --
-    MainWindow._on_build_finished still fires and loads the result when
-    it's done either way).
-    """
-
     cancelled = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
@@ -221,7 +176,7 @@ class BuildProgressDialog(QtWidgets.QDialog):
 
         self.stage_label = QtWidgets.QLabel("Starting SuGaR pipeline...")
         self.progress_bar = QtWidgets.QProgressBar()
-        self.progress_bar.setRange(0, 0)  # indeterminate until a stage reports real numbers
+        self.progress_bar.setRange(0, 0)
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(2000)
@@ -253,27 +208,6 @@ class BuildProgressDialog(QtWidgets.QDialog):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Application window.
-
-    Normally just a toolbar ("Open File...") above the 3DGS view. Clicking
-    "Edit with Digital Twin..." loads a mesh bound to the same Gaussians
-    (see digital_twin.py) and reveals a second, editable-mesh panel in a
-    splitter alongside it. "Sculpt" mode smoothly deforms the mesh with a
-    brush; "Select" mode drags a rectangle (or, holding Shift, a lasso) to
-    select a region; "Pick Object" instead selects with one click, by mesh
-    connectivity (e.g. a cup sitting on, not fused to, a table is its own
-    component -- one click grabs just the cup). Either selection tool then
-    drags the highlighted selection rigidly by click-dragging on it, and
-    "Delete Selected"/"Undo Delete" remove or restore it. All three modes
-    recompute and live-update the Gaussians on the left every edited frame
-    (see mesh_editor.py, digital_twin.py). "Save As..." exports the current
-    Gaussians to a standard 3DGS .ply (gaussian_ply_io.py).
-
-    If the open scene has no digital-twin package yet but does have a
-    locatable multi-view COLMAP source (the `data/Test data/<scene>/plys/*.ply`
-    convention -- see digital_twin_builder.py), "Edit with Digital Twin..."
-    offers to build one automatically instead of just opening a file picker.
-    """
 
     def __init__(self, initial_path: str | None = None):
         super().__init__()
@@ -282,10 +216,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.digital_twin_package: DigitalTwinPackage | None = None
         self._undo_snapshot: DigitalTwinPackage | None = None
+        self._twin_mask_share: float | None = None
+        self._last_cut: np.ndarray | None = None
         self._digital_twin_name: str = ""
         self._current_ply_path: Path | None = None
         self._builder: DigitalTwinBuilder | None = None
         self._build_dialog: BuildProgressDialog | None = None
+        self._density_baseline: DensityBaseline | None = None
+        self._deformation_baseline: DeformationBaseline | None = None
+        self.semantic_labels: np.ndarray | None = None
+        self._digital_twin_path: str | None = None
+        self._preview_scene_source: Path | None = None
+        self._preview_renderer: PreviewRenderer | None = None
+        self._preview_dialog: PreviewDialog | None = None
+        self._preview_work_dir: Path | None = None
+        self._sam_reference: ReferenceGeometry | None = None
+        self._sam_runner: SamPickRunner | None = None
+        self._sam_work_dir: Path | None = None
+        self._sam_pending_mode = "Replace"
+        self._sam_pending_pick: dict | None = None
+        self._sam_last_pick: dict | None = None
+        self._mask_checker: TwinMaskChecker | None = None
 
         self.viewer = GaussianViewer(
             on_open_requested=self._open_file_dialog,
@@ -294,7 +245,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mesh_panel = MeshEditorPanel(
             on_edited=self._on_mesh_edited,
             on_selection_changed=self._on_selection_changed,
+            on_sculpt_finished=self._on_sculpt_finished,
+            on_edit_finished=self._on_edit_finished,
+            pick_resolver=self._resolve_pick,
+            selection_move_allowed=self._selection_move_allowed,
         )
+        self.viewer.view.camera.link(self.mesh_panel.view.camera, props=())
 
         open_button = QtWidgets.QPushButton("Open File...")
         open_button.clicked.connect(self._open_file_dialog)
@@ -307,6 +263,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sculpt_button.setEnabled(False)
         self.sculpt_button.toggled.connect(self._on_sculpt_toggled)
 
+        self.density_button = QtWidgets.QPushButton("Fill Density")
+        self.density_button.setCheckable(True)
+        self.density_button.setEnabled(False)
+        self.density_button.setToolTip(
+            "When on, stretching the mesh with Sculpt adds new Gaussians to fill "
+            "the gap, and compressing it removes extras -- never below the "
+            "original count for that triangle."
+        )
+
+        self.adapt_button = QtWidgets.QPushButton("Adapt Gaussians")
+        self.adapt_button.setCheckable(True)
+        self.adapt_button.setEnabled(False)
+        self.adapt_button.setToolTip(
+            "When on, after each Sculpt or move every Gaussian's orientation and "
+            "scale follow the local rotation/stretch of the triangle it is bound "
+            "to (position always follows the mesh). Applies to edits made while "
+            "on. Works together with Fill Density."
+        )
+        self.adapt_button.toggled.connect(self._on_adapt_toggled)
+
         self.select_button = QtWidgets.QPushButton("Select")
         self.select_button.setCheckable(True)
         self.select_button.setEnabled(False)
@@ -317,9 +293,110 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pick_button.setEnabled(False)
         self.pick_button.toggled.connect(self._on_pick_toggled)
 
+        self.semantic_pick_button = QtWidgets.QPushButton("Semantic Pick")
+        self.semantic_pick_button.setCheckable(True)
+        self.semantic_pick_button.setEnabled(False)
+        self.semantic_pick_button.setToolTip(
+            "When on, Pick Object selects by semantic label from a precomputed "
+            "*_semantic_labels.npy sidecar instead of mesh connectivity -- lets "
+            "it separate objects that got fused into one mesh piece. Only "
+            "enabled when such a sidecar exists for the loaded scene."
+        )
+
+        self.sam_pick_button = QtWidgets.QPushButton("SAM Pick")
+        self.sam_pick_button.setCheckable(True)
+        self.sam_pick_button.setEnabled(False)
+        self.sam_pick_button.setToolTip(
+            "When on, Pick Object selects the object under the click by asking "
+            "Segment Anything for it in the training photographs (runs in the "
+            "gs-train environment; the first click starts SAM and takes 10-20 seconds, "
+            "later ones one to a few) -- separates "
+            "objects that are fused into one mesh piece. Keeps working after Sculpt, "
+            "Delete and Fill Density: the photographs show the twin as it was loaded, "
+            "so a part deleted since still hides what was behind it there. Takes "
+            "priority over Semantic Pick. Enabled when the scene's COLMAP "
+            "source and the SAM checkpoint are found."
+        )
+        self.sam_level_combo = QtWidgets.QComboBox()
+        self.sam_level_combo.addItems(LEVEL_NAMES)
+        self.sam_level_combo.setCurrentIndex(DEFAULT_LEVEL)
+        self.sam_level_combo.setEnabled(False)
+        self.sam_level_combo.setToolTip(
+            "How much SAM Pick selects around the click: Part (a detail), Object, or "
+            "Whole (everything that belongs to the thing under the click)."
+        )
+
+        self.sam_mode_combo = QtWidgets.QComboBox()
+        self.sam_mode_combo.addItems(SAM_MODES)
+        self.sam_mode_combo.setEnabled(False)
+        self.sam_mode_combo.setToolTip(
+            "What a SAM Pick click does with the current selection. Replace: select the object under "
+            "the click. Add: add it. Subtract: remove it. Exclude: run the click that made the "
+            "selection again with this click marked as not part of it, and keep only what stays "
+            "selected (fixes a mask that spilled over; works on the result of one Replace click, "
+            "which Add, Subtract and the other tools end). Holding Shift adds and holding Ctrl "
+            "subtracts, whatever is chosen here."
+        )
+
+        self.sam_vote_combo = QtWidgets.QComboBox()
+        self.sam_vote_combo.addItems(SAM_VOTES)
+        self.sam_vote_combo.setCurrentIndex(0)
+        self.sam_vote_combo.setEnabled(False)
+        self.sam_vote_combo.setToolTip(
+            "How many of the photographs that see a Gaussian must place it inside Segment Anything's "
+            "mask. Majority: more than half (the default). Inclusive: more than three in ten, which "
+            "recovers what partial masks miss but takes background along if the twin holds some. "
+            "Auto: inclusive when the twin holds only its object (built with masks, or passed the "
+            "mask check), majority otherwise."
+        )
+
+        self.sync_view_button = QtWidgets.QPushButton("Sync View")
+        self.sync_view_button.setCheckable(True)
+        self.sync_view_button.setEnabled(False)
+        self.sync_view_button.setToolTip(
+            "When on, orbiting (left-drag) or zooming (mouse wheel or right-drag) either view "
+            "turns or zooms the other one the same way, to compare the twin's mesh with its "
+            "Gaussians from the same angle. Panning (Shift+drag) stays independent. "
+            "Turned off, and re-fitted independently, whenever a twin is (re)loaded."
+        )
+        self.sync_view_button.toggled.connect(self._on_sync_view_toggled)
+
+        self.preview_button = QtWidgets.QPushButton("Render Preview")
+        self.preview_button.setEnabled(False)
+        self.preview_button.setToolTip(
+            "Renders the edited scene next to the originally loaded one, from real "
+            "training cameras, with the 3DGS rasterizer (runs in the gs-train "
+            "environment, takes a few seconds to a minute). Enabled when the "
+            "scene's COLMAP source is found next to the loaded twin."
+        )
+        self.preview_button.clicked.connect(self._on_render_preview)
+
         self.delete_button = QtWidgets.QPushButton("Delete Selected")
         self.delete_button.setEnabled(False)
         self.delete_button.clicked.connect(self._on_delete_selected)
+
+        self.detach_button = QtWidgets.QPushButton("Detach Selected")
+        self.detach_button.setCheckable(True)
+        self.detach_button.setEnabled(False)
+        self.detach_button.setToolTip(
+            "A switch. On: the selection is cut out of the mesh along its edge -- the triangles with "
+            "all three corners selected become a piece of their own (the vertices on the cut are "
+            "duplicated) -- and selections can be dragged; a selection made while it is on is cut "
+            "out when it is dragged, so nothing is ever stretched. Off: no selection is moved, not "
+            "even an object picked whole, and nothing is cut. The Gaussians are not changed. Undo "
+            "puts the mesh back."
+        )
+        self.detach_button.toggled.connect(self._on_detach_toggled)
+
+        self.close_cut_button = QtWidgets.QPushButton("Close Cut")
+        self.close_cut_button.setEnabled(False)
+        self.close_cut_button.setToolTip(
+            "Closes the holes that the last Detach Selected opened, on both sides of the cut: each "
+            "hole along the cut is filled with the triangles of least area between its edge's "
+            "vertices, and every new triangle gets one Gaussian that takes the look of the surface "
+            "next to it. Holes the mesh had before the cut are left alone. Undo removes the patches."
+        )
+        self.close_cut_button.clicked.connect(self._on_close_cut)
 
         self.undo_button = QtWidgets.QPushButton("Undo Delete")
         self.undo_button.setEnabled(False)
@@ -330,25 +407,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_button.clicked.connect(self._on_save_as)
 
         self.status_label = QtWidgets.QLabel("No file loaded")
+        self.twin_notice_label = QtWidgets.QLabel()
+        self.twin_notice_label.setStyleSheet("color: #b45309;")
 
         toolbar = QtWidgets.QToolBar()
         toolbar.setMovable(False)
         toolbar.addWidget(open_button)
         toolbar.addWidget(self.digital_twin_button)
         toolbar.addWidget(self.sculpt_button)
+        toolbar.addWidget(self.density_button)
+        toolbar.addWidget(self.adapt_button)
         toolbar.addWidget(self.select_button)
         toolbar.addWidget(self.pick_button)
+        toolbar.addWidget(self.semantic_pick_button)
+        toolbar.addWidget(self.sam_pick_button)
+        toolbar.addWidget(self.sam_level_combo)
+        toolbar.addWidget(self.sam_mode_combo)
+        toolbar.addWidget(self.sam_vote_combo)
         toolbar.addWidget(self.delete_button)
+        toolbar.addWidget(self.detach_button)
+        toolbar.addWidget(self.close_cut_button)
         toolbar.addWidget(self.undo_button)
+        toolbar.addWidget(self.sync_view_button)
+        toolbar.addWidget(self.preview_button)
         toolbar.addWidget(self.save_button)
         toolbar.addSeparator()
         toolbar.addWidget(self.status_label)
+        self._twin_notice_action = toolbar.addWidget(self.twin_notice_label)
+        self._twin_notice_action.setVisible(False)
         self.addToolBar(toolbar)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.splitter.addWidget(self.viewer.canvas.native)
         self.splitter.addWidget(self.mesh_panel.canvas.native)
-        self.mesh_panel.canvas.native.hide()  # revealed once a digital-twin package is loaded
+        self.mesh_panel.canvas.native.hide()
         self.setCentralWidget(self.splitter)
 
         if initial_path:
@@ -365,6 +457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_ply_path = Path(path)
         self.setWindowTitle(f"3DGS Viewer -- {name}")
         self.status_label.setText(f"{name}   ({count:,} splats)")
+        self.status_label.setToolTip("")
 
     def _open_digital_twin_dialog(self) -> None:
         if self._current_ply_path is not None:
@@ -372,13 +465,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if colmap is not None:
                 cache_path = digital_twin_cache_path(colmap.scene_name)
                 if cache_path.exists():
-                    self._load_digital_twin(str(cache_path))  # cached -- never rebuild
+                    self._load_digital_twin(str(cache_path))
                     return
                 self._confirm_and_build(colmap.scene_name)
                 return
 
-        # No open scene, or no locatable COLMAP source to build from --
-        # fall back to picking an already-exported package by hand.
         path = pick_digital_twin_file(DEFAULT_OPEN_DIR)
         if path:
             self._load_digital_twin(path)
@@ -390,9 +481,9 @@ class MainWindow(QtWidgets.QMainWindow):
             f'No digital-twin package exists yet for "{scene_name}".\n\n'
             "Building one runs the SuGaR pipeline (baseline 3DGS training, "
             "mesh extraction, refinement) at a fast preset. This is a real "
-            "wait -- realistically 45-70 minutes, not instant -- with "
-            "progress shown as it runs. Once built, it's cached and will "
-            "load instantly next time.\n\nStart now?",
+            "wait -- roughly 10-20 minutes on a recent GPU, longer on slower "
+            "hardware, not instant -- with progress shown as it runs. Once "
+            "built, it's cached and will load instantly next time.\n\nStart now?",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No,
         )
@@ -430,30 +521,64 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_digital_twin(self, path: str) -> None:
         self.digital_twin_package = load_digital_twin_package(path)
+        self.digital_twin_package.start_tracking_origins()
         self._undo_snapshot = None
         self.undo_button.setEnabled(False)
         self._digital_twin_name = Path(path).name
+        self.sync_view_button.setChecked(False)
+        self.detach_button.blockSignals(True)
+        self.detach_button.setChecked(False)
+        self.detach_button.blockSignals(False)
         self._reload_panels_from_package()
+
+        self.semantic_labels = load_semantic_labels(path, len(self.digital_twin_package))
+        self.semantic_pick_button.setEnabled(self.semantic_labels is not None)
+
+        self._digital_twin_path = path
+        self._preview_scene_source = find_scene_source_for_twin(path)
+        self.preview_button.setEnabled(self._preview_scene_source is not None)
+
+        self._cancel_sam_pick()
+        sam_available = self._preview_scene_source is not None and sam_checkpoint_available()
+        self._sam_reference = ReferenceGeometry.capture(self.digital_twin_package) if sam_available else None
+        self.sam_pick_button.setChecked(False)
+        self.sam_pick_button.setEnabled(sam_available)
+        self.sam_level_combo.setEnabled(sam_available)
+        self.sam_mode_combo.setEnabled(sam_available)
+        self.sam_mode_combo.setCurrentIndex(0)
+        self.sam_vote_combo.setEnabled(sam_available)
+        self.sam_vote_combo.setCurrentIndex(0)
+        self._twin_mask_share = None
+
+        self._start_mask_check(path)
 
         self.mesh_panel.canvas.native.show()
         self.splitter.setSizes([1, 1])
         self.sculpt_button.setEnabled(True)
+        self.density_button.setEnabled(True)
+        self.adapt_button.setEnabled(True)
         self.select_button.setEnabled(True)
         self.pick_button.setEnabled(True)
+        self.sync_view_button.setEnabled(True)
         self.save_button.setEnabled(True)
 
         self.setWindowTitle(f"3DGS Viewer -- {self._digital_twin_name} (digital twin)")
 
     def _reload_panels_from_package(self) -> None:
-        """Refresh both panels from `self.digital_twin_package` (used after
-        the initial load, and again after any delete/undo, since those
-        change the vertex/face/Gaussian counts)."""
         package = self.digital_twin_package
         self.mesh_panel.load_mesh(package.mesh_vertices, package.mesh_faces)
-        # Editing mutates mesh_panel.vertices in place; re-point the package
-        # at that same array so recompute_gaussian_positions() sees live edits.
         package.mesh_vertices = self.mesh_panel.vertices
-        self.delete_button.setEnabled(False)  # load_mesh() just cleared the selection
+        self.delete_button.setEnabled(False)
+        self.detach_button.setEnabled(True)
+        self._last_cut = None
+        self.close_cut_button.setEnabled(False)
+        self._density_baseline = DensityBaseline.capture(package)
+        self._deformation_baseline = (
+            DeformationBaseline.capture(package) if self.adapt_button.isChecked() else None
+        )
+        self.semantic_labels = None
+        self.semantic_pick_button.setChecked(False)
+        self.semantic_pick_button.setEnabled(False)
 
         count = self.viewer.load_from_package(package)
         self.status_label.setText(f"{self._digital_twin_name}   ({count:,} splats, {len(package.mesh_vertices):,} verts)")
@@ -463,6 +588,272 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         positions = self.digital_twin_package.recompute_gaussian_positions()
         self.viewer.update_positions(positions)
+
+    def _on_adapt_toggled(self, checked: bool) -> None:
+        if not checked or self.digital_twin_package is None:
+            self._deformation_baseline = None
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            self._deformation_baseline = DeformationBaseline.capture(self.digital_twin_package)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _on_edit_finished(self) -> None:
+        if not self.adapt_button.isChecked() or self.digital_twin_package is None:
+            return
+        if self._deformation_baseline is None:
+            return
+        package = self.digital_twin_package
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            updated = adapt_gaussians_to_deformation(package, self._deformation_baseline)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if updated:
+            self.status_label.setText(
+                f"{self._digital_twin_name}   ({len(package):,} splats, "
+                f"{len(package.mesh_vertices):,} verts)   adapted {updated:,} Gaussians"
+            )
+
+    def _on_sculpt_finished(self) -> None:
+        if not self.density_button.isChecked() or self.digital_twin_package is None:
+            return
+        if self._density_baseline is None:
+            return
+        changed = rebalance_density(self.digital_twin_package, self._density_baseline)
+        if not changed:
+            return
+        self.semantic_labels = None
+        self.semantic_pick_button.setChecked(False)
+        self.semantic_pick_button.setEnabled(False)
+        package = self.digital_twin_package
+        count = self.viewer.load_from_package(package)
+        self.status_label.setText(
+            f"{self._digital_twin_name}   ({count:,} splats, {len(package.mesh_vertices):,} verts)"
+        )
+
+    def _resolve_semantic_pick(self, vertex_index: int) -> np.ndarray | None:
+        if not self.semantic_pick_button.isChecked() or self.semantic_labels is None:
+            return None
+        package = self.digital_twin_package
+        target_label = label_at_vertex(
+            package.mesh_faces, package.gaussian_face_idx, self.semantic_labels, vertex_index
+        )
+        return labels_to_vertex_selection(
+            package.mesh_faces, package.gaussian_face_idx, self.semantic_labels, target_label
+        )
+
+    def _resolve_pick(self, vertex_index: int) -> np.ndarray | None:
+        if self.sam_pick_button.isChecked():
+            return self._resolve_sam_pick(vertex_index)
+        return self._resolve_semantic_pick(vertex_index)
+
+    def _keep_selection(self) -> np.ndarray:
+        current = self.mesh_panel.selected_vertices
+        return current if current is not None else np.empty(0, dtype=np.int64)
+
+    def _sam_click_mode(self) -> str:
+        held = {getattr(key, "name", str(key)) for key in self.mesh_panel.pick_modifiers}
+        if "Shift" in held:
+            return "Add"
+        if "Control" in held:
+            return "Subtract"
+        return self.sam_mode_combo.currentText()
+
+    def _resolve_sam_pick(self, vertex_index: int) -> np.ndarray:
+        package, reference = self.digital_twin_package, self._sam_reference
+        if package is None or reference is None:
+            return self._keep_selection()
+        if self._sam_runner is not None and self._sam_runner.is_busy():
+            self.status_label.setText("SAM Pick: still working on the previous click...")
+            return self._keep_selection()
+        if not reference.maps(package):
+            self.status_label.setText(
+                "SAM Pick cannot trace this twin back to the one that was loaded; reload the twin."
+            )
+            return self._keep_selection()
+
+        mode = self._sam_click_mode()
+        current = self.mesh_panel.selected_vertices
+        if mode in ("Subtract", "Exclude") and current is None:
+            self.status_label.setText(f"SAM Pick ({mode.lower()}): nothing is selected yet.")
+            return self._keep_selection()
+        point, level, negatives = reference.point_of(package, vertex_index), self.sam_level_combo.currentIndex(), np.empty((0, 3))
+        min_ratio, vote_reason = self._sam_vote()
+        if mode == "Exclude":
+            last = self._sam_last_pick
+            if last is None or not np.array_equal(np.unique(current), last["selection"]):
+                self.status_label.setText(
+                    "SAM Pick (exclude): Exclude corrects the result of one SAM Pick click, and this selection "
+                    "was made or changed otherwise (Add, Subtract, another tool). Click with Replace first."
+                )
+                return self._keep_selection()
+            point, level = last["point"], last["level"]
+            min_ratio, vote_reason = last.get("min_ratio"), last.get("vote_reason", "")
+            negatives = np.vstack([last["negatives"], reference.point_of(package, vertex_index)])
+
+        if self._sam_work_dir is None:
+            self._sam_work_dir = Path(tempfile.mkdtemp(prefix="dt_sampick_"))
+            np.save(self._sam_work_dir / "positions.npy", reference.positions)
+        if self._sam_runner is None:
+            self._sam_runner = SamPickRunner(self)
+            self._sam_runner.finished.connect(self._on_sam_finished)
+            self._sam_runner.log_line.connect(self._on_sam_log_line)
+        runner = self._sam_runner
+        cold = not runner.is_running()
+        if cold:
+            runner.start(self._preview_scene_source, self._sam_work_dir / "positions.npy")
+        vote = f" (vote: {vote_reason})" if vote_reason else ""
+        self.status_label.setText(("SAM Pick: starting SAM and segmenting..." if cold else "SAM Pick: segmenting...") + vote)
+        self._sam_pending_mode = mode
+        self._sam_pending_pick = {"point": point, "level": level, "negatives": negatives,
+                                  "min_ratio": min_ratio, "vote_reason": vote_reason}
+        extra = {} if min_ratio is None else {"min_ratio": min_ratio}
+        runner.request(point, level, self._sam_work_dir / "selected.npy", negative_points=negatives, **extra)
+        return self._keep_selection()
+
+    def _sam_vote(self) -> tuple[float | None, str]:
+        choice = self.sam_vote_combo.currentText()
+        if choice == "Inclusive":
+            return INCLUSIVE, "inclusive"
+        if choice != "Auto":
+            return None, ""
+        record = self.digital_twin_package.provenance if self.digital_twin_package is not None else None
+        if record and record.get("masked"):
+            return INCLUSIVE, "inclusive, the twin was built with masks"
+        share = self._twin_mask_share
+        if share is not None and share >= MASK_SHARE_WARNING:
+            return INCLUSIVE, f"inclusive, {share:.0%} of the twin lies inside the masks"
+        if share is not None:
+            return MAJORITY, f"majority, only {share:.0%} of the twin lies inside the masks"
+        return MAJORITY, "majority, nothing is known about what the twin holds"
+
+    def _on_sam_log_line(self, line: str) -> None:
+        if line.startswith("round"):
+            self.status_label.setText(f"SAM Pick: {line}")
+
+    def _on_sam_finished(self, success: bool, payload) -> None:
+        path = payload["path"] if success else None
+        mask = None
+        if success:
+            try:
+                mask = np.load(path)
+            except (OSError, ValueError) as error:
+                success, payload = False, f"SAM Pick reported a result that could not be read:\n{error}"
+        if path is not None:
+            Path(path).unlink(missing_ok=True)
+        if not success:
+            self.status_label.setText("SAM Pick failed")
+            QtWidgets.QMessageBox.warning(self, "SAM Pick failed", payload)
+            return
+
+        package, reference = self.digital_twin_package, self._sam_reference
+        if package is None or reference is None or mask.shape[0] != len(reference.positions) or not reference.maps(package):
+            self.status_label.setText("SAM Pick: result discarded -- the twin changed while SAM was running.")
+            return
+        selection = reference.selection_in(package, mask)
+        if selection is None:
+            if payload.get("views", 1) == 0:
+                self.status_label.setText(
+                    "SAM Pick: no training photograph shows that point -- a part that is deleted "
+                    "now may hide it in all of them."
+                )
+            elif mask.any():
+                self.status_label.setText("SAM Pick: everything SAM found under that point has been deleted.")
+            else:
+                self.status_label.setText("SAM Pick: SAM found no object under that point.")
+            return
+        mode, self._sam_pending_mode = self._sam_pending_mode, "Replace"
+        pick, self._sam_pending_pick = self._sam_pending_pick, None
+        current = self.mesh_panel.selected_vertices
+        found = f"{int(mask.sum()):,} Gaussians, {len(selection):,} vertices"
+        removed = 0
+        if mode == "Add" and current is not None:
+            selection = np.union1d(current, selection)
+        elif mode == "Subtract":
+            selection = np.setdiff1d(current, selection) if current is not None else selection[:0]
+        elif mode == "Exclude":
+            kept = np.intersect1d(current, selection) if current is not None else selection[:0]
+            if kept.size == 0:
+                self.status_label.setText("SAM Pick (exclude): that would leave nothing selected, so nothing was changed.")
+                return
+            removed, selection = len(current) - len(kept), kept
+        self.mesh_panel.set_selection(selection)
+        self._sam_last_pick = (
+            {**pick, "selection": np.unique(selection)} if pick is not None and mode in ("Replace", "Exclude") else None
+        )
+        if mode == "Replace":
+            self.status_label.setText(
+                f"SAM Pick: {int(mask.sum()):,} Gaussians, {len(selection):,} vertices selected "
+                f"(from {payload['views']} photographs)"
+            )
+        elif mode == "Exclude":
+            self.status_label.setText(
+                f"SAM Pick (exclude): {removed:,} vertices removed; {len(selection):,} vertices selected now"
+            )
+        else:
+            self.status_label.setText(
+                f"SAM Pick ({mode.lower()}): found {found}; {len(selection):,} vertices selected now"
+            )
+
+    def _start_mask_check(self, path: str) -> None:
+        self._cancel_mask_check()
+        self._set_twin_notice(None)
+        record = self.digital_twin_package.provenance
+        self.status_label.setToolTip(describe(record))
+        source = self._preview_scene_source
+        if source is None or (record and record.get("masked")) or not scene_has_masks(source):
+            return
+        cached = load_cached_check(path)
+        if cached is not None:
+            self._twin_mask_share = cached["share"]
+            self._set_twin_notice(assess(record, cached["share"]), cached["share"])
+            return
+        if not GS_TRAIN_PYTHON.is_file():
+            return
+        checker = TwinMaskChecker(self)
+        checker.finished.connect(lambda success, payload, who=checker, twin=path: self._on_mask_check_finished(who, twin, success, payload))
+        self._mask_checker = checker
+        checker.start(path, source)
+
+    def _on_mask_check_finished(self, checker: TwinMaskChecker, twin_path: str, success: bool, payload) -> None:
+        if checker is not self._mask_checker:
+            return
+        self._mask_checker = None
+        checker.deleteLater()
+        if not success:
+            return
+        save_cached_check(twin_path, payload["share"], payload["considered"], payload["views"])
+        self._twin_mask_share = payload["share"]
+        self._set_twin_notice(assess(self.digital_twin_package.provenance, payload["share"]), payload["share"])
+
+    def _set_twin_notice(self, message: str | None, share: float | None = None) -> None:
+        self._twin_notice_action.setVisible(message is not None)
+        self.twin_notice_label.setText(f"Masks: only {share:.0%} of the twin inside" if message and share is not None else "")
+        self.twin_notice_label.setToolTip(message or "")
+
+    def _cancel_mask_check(self) -> None:
+        checker, self._mask_checker = self._mask_checker, None
+        if checker is not None:
+            checker.finished.disconnect()
+            checker.cancel()
+            checker.deleteLater()
+
+    def _cancel_sam_pick(self, wait_ms: int = 0) -> None:
+        runner, work_dir = self._sam_runner, self._sam_work_dir
+        self._sam_runner = self._sam_work_dir = None
+        self._sam_pending_pick = self._sam_last_pick = None
+        if runner is not None:
+            runner.finished.disconnect(self._on_sam_finished)
+            runner.close(wait_ms)
+        if work_dir is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    def closeEvent(self, event) -> None:
+        self._cancel_mask_check()
+        self._cancel_sam_pick(wait_ms=3000)
+        super().closeEvent(event)
 
     def _on_sculpt_toggled(self, checked: bool) -> None:
         if checked:
@@ -482,6 +873,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.select_button.setChecked(False)
         self.mesh_panel.set_mode("pick" if checked else "orbit")
 
+    def _on_sync_view_toggled(self, checked: bool) -> None:
+        self.viewer.view.camera.link(
+            self.mesh_panel.view.camera, props=SYNCED_CAMERA_PROPS if checked else ()
+        )
+
     def _on_selection_changed(self, selected_vertices: np.ndarray | None) -> None:
         self.delete_button.setEnabled(selected_vertices is not None)
 
@@ -491,7 +887,119 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo_snapshot = self.digital_twin_package.clone()
         self.digital_twin_package.remove_faces_by_vertex_selection(self.mesh_panel.selected_vertices)
         self._reload_panels_from_package()
+        self.undo_button.setText("Undo Delete")
         self.undo_button.setEnabled(True)
+
+    def _on_detach_selected(self) -> None:
+        package, selected = self.digital_twin_package, self.mesh_panel.selected_vertices
+        if package is None or selected is None:
+            return
+        snapshot = package.clone()
+        result = detach_selection(package, selected)
+        if result is None:
+            self.status_label.setText("Detach: no triangle has all three corners selected -- select a larger area.")
+            return
+        if result.vertices_duplicated == 0:
+            self.mesh_panel.set_selection(result.selection)
+            self.status_label.setText(
+                f"Detach: the selection is a piece of its own already ({result.faces_detached:,} triangles) "
+                f"and can be moved."
+            )
+            return
+        self._take_cut(snapshot, result)
+        self.status_label.setText(
+            f"Detached {result.faces_detached:,} triangles; {result.vertices_duplicated:,} vertices on the cut "
+            f"were duplicated. The selection now moves on its own."
+        )
+
+    def _take_cut(self, snapshot, result) -> None:
+        package = self.digital_twin_package
+        self._undo_snapshot = snapshot
+        self.mesh_panel.replace_mesh(package.mesh_vertices, package.mesh_faces, result.selection)
+        package.mesh_vertices = self.mesh_panel.vertices
+        self._last_cut = np.concatenate([result.cut_originals, result.cut_copies])
+        self.close_cut_button.setEnabled(True)
+        self.undo_button.setText("Undo Detach")
+        self.undo_button.setEnabled(True)
+
+    def _on_detach_toggled(self, checked: bool) -> None:
+        if not checked:
+            self.status_label.setText("Detach Selected is off: selections are not moved.")
+            return
+        if self.mesh_panel.selected_vertices is None:
+            self.status_label.setText(
+                "Detach Selected is on: a selection is cut out of the mesh when it is dragged."
+            )
+            return
+        self._on_detach_selected()
+
+    def _selection_move_allowed(self) -> bool:
+        if not self.detach_button.isChecked():
+            self.status_label.setText(
+                "Moving is off: turn Detach Selected on to cut the selection out and move it."
+            )
+            return False
+        package, selected = self.digital_twin_package, self.mesh_panel.selected_vertices
+        if package is None or selected is None:
+            return False
+        faces, n_vertices = package.mesh_faces, package.mesh_vertices.shape[0]
+        if not stretches_on_move(faces, selected, n_vertices):
+            return True
+        left = np.setdiff1d(selected, faces[inside_faces(faces, selected, n_vertices)]).size  # without a whole triangle
+        snapshot = package.clone()
+        result = detach_selection(package, selected)
+        if result is None:
+            self.status_label.setText(
+                "Detach: no triangle has all three corners selected, so the selection is not moved."
+            )
+            return False
+        if result.vertices_duplicated == 0:  # a piece of its own already, with loose vertices selected besides
+            self.mesh_panel.set_selection(result.selection)
+            return True
+        self._take_cut(snapshot, result)
+        self.status_label.setText(
+            f"Detached {result.faces_detached:,} triangles to move them ({result.vertices_duplicated:,} vertices "
+            f"on the cut duplicated)" + (f"; {left:,} selected vertices without a whole triangle stay behind" if left else "")
+            + ". Undo puts the part back."
+        )
+        return True
+
+    def _on_close_cut(self) -> None:
+        package, cut = self.digital_twin_package, self._last_cut
+        if package is None or cut is None:
+            return
+        snapshot = package.clone()
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            result = close_cut(package, cut)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if result.faces_added == 0:
+            self.status_label.setText("Close Cut: the cut left no hole that could be closed.")
+            return
+        self._undo_snapshot = snapshot
+        self._last_cut = None
+        self.close_cut_button.setEnabled(False)
+        selection = self.mesh_panel.selected_vertices
+        self.mesh_panel.replace_mesh(package.mesh_vertices, package.mesh_faces, selection)
+        package.mesh_vertices = self.mesh_panel.vertices
+        self._density_baseline = DensityBaseline.capture(package)
+        self._deformation_baseline = (
+            DeformationBaseline.capture(package) if self.adapt_button.isChecked() else None
+        )
+        self.semantic_labels = None
+        self.semantic_pick_button.setChecked(False)
+        self.semantic_pick_button.setEnabled(False)
+        self.viewer.load_from_package(package, keep_view=True)
+        self.undo_button.setText("Undo Close Cut")
+        self.undo_button.setEnabled(True)
+        still_open = (
+            f"; {result.cut_edges_open_after:,} edges of the cut stay open where it ran into holes the mesh had before"
+            if result.cut_edges_open_after else ""
+        )
+        self.status_label.setText(
+            f"Closed {result.cycles_closed:,} holes with {result.faces_added:,} triangles and as many Gaussians{still_open}."
+        )
 
     def _on_undo_delete(self) -> None:
         if self._undo_snapshot is None:
@@ -500,6 +1008,51 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo_snapshot = None
         self._reload_panels_from_package()
         self.undo_button.setEnabled(False)
+
+    def _on_render_preview(self) -> None:
+        package = self.digital_twin_package
+        if package is None or self._preview_scene_source is None or self._digital_twin_path is None:
+            return
+        if self._preview_dialog is not None:
+            self._preview_dialog.close()
+
+        self._preview_work_dir = Path(tempfile.mkdtemp(prefix="dt_preview_"))
+        edited_path = self._preview_work_dir / "after.npz"
+        save_digital_twin_package(str(edited_path), package)
+
+        dialog = PreviewDialog(self)
+        renderer = PreviewRenderer(self)
+        renderer.finished.connect(self._on_preview_finished)
+        dialog.finished.connect(self._on_preview_dialog_closed)
+        self._preview_dialog, self._preview_renderer = dialog, renderer
+
+        self.preview_button.setEnabled(False)
+        dialog.show()
+        renderer.start(
+            self._preview_scene_source,
+            {"before": self._digital_twin_path, "after": edited_path},
+            self._preview_work_dir,
+        )
+
+    def _on_preview_finished(self, success: bool, payload) -> None:
+        self.preview_button.setEnabled(self._preview_scene_source is not None)
+        if self._preview_work_dir is not None:
+            # until the dialog closes.
+            (self._preview_work_dir / "after.npz").unlink(missing_ok=True)
+        if self._preview_dialog is None:
+            return
+        if success:
+            self._preview_dialog.show_results(payload)
+        else:
+            self._preview_dialog.set_failed(payload)
+
+    def _on_preview_dialog_closed(self, _result: int) -> None:
+        if self._preview_renderer is not None:
+            self._preview_renderer.cancel()
+        if self._preview_work_dir is not None:
+            shutil.rmtree(self._preview_work_dir, ignore_errors=True)
+        self._preview_dialog = self._preview_renderer = self._preview_work_dir = None
+        self.preview_button.setEnabled(self._preview_scene_source is not None)
 
     def _on_save_as(self) -> None:
         if self.digital_twin_package is None:

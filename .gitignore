@@ -6,6 +6,10 @@ data/gaussian_scenes/**
 data/Test data/**
 results/renders/**
 results/logs/**
+thesis/**
+thesis_backup_2026-09-29/**
+thesis_backup_2026-10-01/**
+thesis_backup_2026-10-02/**
 
 __pycache__/
 *.pyc

@@ -1,15 +1,17 @@
-"""Unit tests for the pure path-logic helpers in
-src/viewer/digital_twin_builder.py (no GPU/subprocess needed). The QProcess
-orchestration itself (DigitalTwinBuilder) is exercised manually against a
-real scene -- see experiments/02_mesh_based_digital_twin_editing/README.md.
-"""
-
+import json
 from pathlib import Path
 
+from PyQt5 import QtCore
+
+import src.viewer.digital_twin_builder as builder_module
 from src.viewer.digital_twin_builder import (
+    REFINE_ITERATIONS,
     ColmapSource,
+    DigitalTwinBuilder,
+    build_preset,
     digital_twin_cache_path,
     find_colmap_source,
+    write_provenance_file,
 )
 
 
@@ -82,10 +84,6 @@ class TestFindColmapSource:
         assert result.frame_dir.name == "frame_0000"
 
     def test_two_scenes_with_identical_frame_names_resolve_to_different_scene_names(self, tmp_path):
-        """The real data/Test data/ layout: lego_bugatti and lego_ferrari
-        both have a colmap_data/frame_0000/ -- the collision this whole
-        feature has to avoid is in the *scene name* SuGaR derives output
-        folders from, not the frame folder name itself."""
         bugatti_dir = _make_scene(tmp_path, "lego_bugatti")
         ferrari_dir = _make_scene(tmp_path, "lego_ferrari")
 
@@ -106,3 +104,112 @@ class TestDigitalTwinCachePath:
 
     def test_uses_the_given_scene_name(self):
         assert digital_twin_cache_path("lego_bugatti").name == "lego_bugatti_digital_twin.npz"
+
+
+def _normalized_source(root: Path, images: int = 3, masks: int = 3) -> Path:
+    (root / "images").mkdir(parents=True)
+    (root / "masks").mkdir()
+    for i in range(images):
+        (root / "images" / f"{i:04d}.jpg").write_bytes(b"x")
+    for i in range(masks):
+        (root / "masks" / f"{i:04d}.png").write_bytes(b"x")
+    return root
+
+
+class TestBuildRecordFile:
+    def test_the_preset_is_the_one_the_build_uses(self):
+        assert build_preset()["refine_iterations"] == REFINE_ITERATIONS
+        assert set(build_preset()) >= {"baseline_iterations", "coarse_iterations", "refine_iterations", "mesh_triangles_target"}
+
+    def test_the_record_is_written_to_a_temporary_file_for_the_export_script(self, tmp_path):
+        source = _normalized_source(tmp_path / "lego_x")
+
+        path = write_provenance_file("lego_x", source)
+
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            assert record["scene"] == "lego_x" and record["photographs"] == 3 and record["masked"] is True
+            assert record["preset"] == build_preset()
+        finally:
+            path.unlink()
+
+    def test_a_record_that_cannot_be_made_gives_no_file_and_raises_nothing(self, tmp_path, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(builder_module, "build_record", refuse)
+
+        assert write_provenance_file("lego_x", tmp_path) is None
+
+
+class _FakeProcess:
+    """Stands in for QProcess in the export step: records how it is set up, starts nothing."""
+
+    MergedChannels = 0
+    created = []
+
+    def __init__(self, parent=None):
+        self.arguments = []
+        self.started = False
+        self.readyRead = _FakeSignal()
+        self.finished = _FakeSignal()
+        _FakeProcess.created.append(self)
+
+    def setProgram(self, program): ...
+    def setArguments(self, arguments): self.arguments = list(arguments)
+    def setWorkingDirectory(self, directory): ...
+    def setProcessEnvironment(self, environment): ...
+    def setProcessChannelMode(self, mode): ...
+    def start(self): self.started = True
+
+
+class _FakeSignal:
+    def connect(self, slot):
+        self.slot = slot
+
+
+class TestExportStep:
+    def _builder(self, monkeypatch, source_root: Path) -> DigitalTwinBuilder:
+        _FakeProcess.created.clear()
+        monkeypatch.setattr(QtCore, "QProcess", _FakeProcess)
+        monkeypatch.setattr(builder_module, "NORMALIZED_SOURCE_ROOT", source_root)
+        builder = DigitalTwinBuilder()
+        builder._scene_name = "lego_x"
+        return builder
+
+    def test_the_export_is_given_the_build_record_and_the_file_is_removed_afterwards(self, tmp_path, monkeypatch):
+        _normalized_source(tmp_path / "lego_x")
+        builder = self._builder(monkeypatch, tmp_path)
+
+        builder._start_export(tmp_path / "refined.pt")
+
+        (process,) = _FakeProcess.created
+        record_path = Path(process.arguments[process.arguments.index("--provenance") + 1])
+        assert process.started and json.loads(record_path.read_text(encoding="utf-8"))["scene"] == "lego_x"
+        done = tmp_path / "twin.npz"
+        done.write_bytes(b"x")
+        builder._on_export_finished(0, None, done)
+        assert not record_path.exists()
+
+    def test_the_rest_of_the_export_command_is_what_it_was(self, tmp_path, monkeypatch):
+        _normalized_source(tmp_path / "lego_x")
+        builder = self._builder(monkeypatch, tmp_path)
+
+        builder._start_export(tmp_path / "refined.pt")
+
+        arguments = _FakeProcess.created[0].arguments
+        for flag in ("--scene-path", "--gs-output-dir", "--refined-checkpoint", "--iteration-to-load", "--out"):
+            assert flag in arguments
+        assert arguments[0] == "-u" and arguments[1].endswith("export_digital_twin_package.py")
+
+    def test_a_build_goes_ahead_without_a_record_if_the_record_cannot_be_written(self, tmp_path, monkeypatch):
+        builder = self._builder(monkeypatch, tmp_path)
+        monkeypatch.setattr(builder_module, "write_provenance_file", lambda scene, source: None)
+
+        builder._start_export(tmp_path / "refined.pt")
+
+        (process,) = _FakeProcess.created
+        assert process.started and "--provenance" not in process.arguments
+        done = tmp_path / "twin.npz"
+        done.write_bytes(b"x")
+        builder._on_export_finished(0, None, done)  # nothing to remove, and no error

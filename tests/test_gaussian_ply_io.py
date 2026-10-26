@@ -1,7 +1,3 @@
-"""Unit tests for src/viewer/gaussian_ply_io.py: the .ply read/write format
-used by both the base viewer and the digital-twin "Save As..." button.
-"""
-
 import numpy as np
 import pytest
 
@@ -40,10 +36,6 @@ def test_round_trip_preserves_rotations(tmp_path):
 
     save_gaussian_ply(str(path), positions, colors, opacities, scales, rotations=rotations)
     cloud = load_gaussian_ply(str(path))
-
-    # load_gaussian_ply's GaussianCloud does not expose rotations (the base
-    # viewer treats every splat as isotropic) -- read them back via plyfile
-    # directly to confirm they were actually written, not silently dropped.
     from plyfile import PlyData
 
     vertex = PlyData.read(str(path))["vertex"].data
@@ -88,9 +80,6 @@ def test_load_falls_back_for_plain_xyz_point_cloud(tmp_path):
 
 
 def test_load_falls_back_for_rgb_point_cloud(tmp_path):
-    """A .ply with red/green/blue (e.g. a colored COLMAP point cloud) but no
-    Gaussian-specific fields should use that color instead of the flat gray
-    fallback."""
     from plyfile import PlyData, PlyElement
 
     n = 8
@@ -112,8 +101,5 @@ def test_load_falls_back_for_rgb_point_cloud(tmp_path):
 
 @pytest.mark.parametrize("dc", [-2.0, 0.0, 2.0])
 def test_sh_color_conversion_round_trips_and_clips(dc):
-    """save_gaussian_ply's `color = 0.5 + SH_C0 * dc` <-> load's inverse
-    should agree, and out-of-range colors should clip into [0, 1] rather
-    than wrapping or producing negative/blown-out values."""
     color = np.clip(0.5 + SH_C0 * dc, 0.0, 1.0)
     assert 0.0 <= color <= 1.0

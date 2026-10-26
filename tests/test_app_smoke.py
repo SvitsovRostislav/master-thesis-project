@@ -1,15 +1,3 @@
-"""End-to-end smoke tests for the actual application (src/viewer/app.py).
-
-These exercise MainWindow the same way a user would (open a file, load a
-digital-twin package, select/move/delete/undo/save), calling the real
-button-handler methods directly rather than reimplementing their logic --
-regressions here would mean the app itself is broken, not just a helper
-function. The digital-twin scenario needs a real exported package
-(data/gaussian_scenes/bonsai_digital_twin.npz, ~95 MB, produced by
-scripts/export_digital_twin_package.py from a trained SuGaR checkpoint) --
-it is not committed as a repo fixture, so that test is skipped if absent.
-"""
-
 import sys
 from pathlib import Path
 
@@ -25,11 +13,9 @@ BONSAI_TWIN = REPO_ROOT / "data" / "gaussian_scenes" / "bonsai_digital_twin.npz"
 
 
 class _FakeEvent:
-    """Minimal stand-in for a vispy mouse event -- just enough attributes
-    for the handler under test to read."""
-
-    def __init__(self, pos):
+    def __init__(self, pos, buttons=()):
         self.pos = np.asarray(pos, dtype=np.float64)
+        self.buttons = buttons
 
 
 @pytest.mark.skipif(not SAMPLE_PLY.exists(), reason=f"sample fixture missing: {SAMPLE_PLY}")
@@ -37,7 +23,7 @@ def test_open_plain_ply(qapp):
     window = MainWindow(initial_path=None)
     window._load(str(SAMPLE_PLY))
 
-    assert window.viewer._sizes is not None  # only set once _display() has run
+    assert window.viewer._sizes is not None
     assert window.viewer._sizes.shape[0] > 0
     assert SAMPLE_PLY.name in window.status_label.text()
     window.close()
@@ -47,8 +33,10 @@ def test_digital_twin_controls_disabled_until_a_package_is_loaded(qapp):
     window = MainWindow(initial_path=None)
 
     assert not window.sculpt_button.isEnabled()
+    assert not window.density_button.isEnabled()
     assert not window.select_button.isEnabled()
     assert not window.pick_button.isEnabled()
+    assert not window.semantic_pick_button.isEnabled()
     assert not window.save_button.isEnabled()
     assert not window.delete_button.isEnabled()
     assert not window.undo_button.isEnabled()
@@ -57,8 +45,6 @@ def test_digital_twin_controls_disabled_until_a_package_is_loaded(qapp):
 
 @pytest.mark.skipif(not BONSAI_TWIN.exists(), reason=f"digital-twin fixture missing: {BONSAI_TWIN}")
 class TestDigitalTwinEndToEnd:
-    """Same scenario as the manual verification run during development,
-    kept here so a future change can't silently break it."""
 
     def test_load_enables_editing_controls(self, qapp):
         window = MainWindow(initial_path=None)
@@ -68,10 +54,12 @@ class TestDigitalTwinEndToEnd:
 
         assert window.digital_twin_package is not None
         assert window.sculpt_button.isEnabled()
+        assert window.density_button.isEnabled()
         assert window.select_button.isEnabled()
         assert window.pick_button.isEnabled()
         assert window.save_button.isEnabled()
-        assert not window.delete_button.isEnabled()  # nothing selected yet
+        assert not window.semantic_pick_button.isEnabled()
+        assert not window.delete_button.isEnabled()
         window.close()
 
     def test_select_move_delete_undo_round_trip(self, qapp):
@@ -87,8 +75,6 @@ class TestDigitalTwinEndToEnd:
         window.select_button.setChecked(True)
         assert panel.mode == "select"
 
-        # Select a small box around the canvas center (same technique as
-        # the manual verification driver).
         cx, cy = panel.canvas.size[0] / 2.0, panel.canvas.size[1] / 2.0
         panel._select_drag_kind = "rect"
         panel._select_path = [(cx - 40, cy - 40), (cx + 40, cy + 40)]
@@ -112,9 +98,6 @@ class TestDigitalTwinEndToEnd:
         window.close()
 
     def test_pick_delete_undo_round_trip(self, qapp):
-        """Same scenario as test_select_move_delete_undo_round_trip, but
-        selecting via "Pick Object" (click -> mesh-connectivity component)
-        instead of a rectangle drag."""
         window = MainWindow(initial_path=None)
         window.show()
         window._load_digital_twin(str(BONSAI_TWIN))
@@ -168,4 +151,111 @@ class TestDigitalTwinEndToEnd:
         expected_positions = window.digital_twin_package.recompute_gaussian_positions()
         np.testing.assert_allclose(cloud.positions[:500], expected_positions[:500], atol=1e-3)
 
+        window.close()
+
+    def _drag_a_vertex_far_away(self, panel):
+        """Sculpt-drags the mesh vertex closest to the canvas center a long
+        way, which stretches the triangles around it substantially."""
+        cx, cy = panel.canvas.size[0] / 2.0, panel.canvas.size[1] / 2.0
+        screen_verts = panel._project_to_canvas(panel.vertices)
+        nearest = screen_verts[int(np.argmin(np.linalg.norm(screen_verts - [cx, cy], axis=1)))]
+
+        panel._sculpt_press(_FakeEvent(nearest))
+        panel._sculpt_move(_FakeEvent(nearest + [250.0, 250.0], buttons=(1,)))
+        panel._sculpt_release()
+
+    def test_fill_density_toggle_off_leaves_gaussian_count_unchanged(self, qapp):
+        """Regression guard: with the toggle off, Sculpt must behave exactly
+        as it did before this feature existed."""
+        window = MainWindow(initial_path=None)
+        window.show()
+        window._load_digital_twin(str(BONSAI_TWIN))
+        qapp.processEvents()
+        original_gaussians = len(window.digital_twin_package)
+
+        window.sculpt_button.setChecked(True)
+        assert not window.density_button.isChecked()  # off by default
+
+        self._drag_a_vertex_far_away(window.mesh_panel)
+
+        assert len(window.digital_twin_package) == original_gaussians
+        window.close()
+
+    def test_fill_density_toggle_on_adds_gaussians_when_stretched(self, qapp):
+        window = MainWindow(initial_path=None)
+        window.show()
+        window._load_digital_twin(str(BONSAI_TWIN))
+        qapp.processEvents()
+        original_gaussians = len(window.digital_twin_package)
+
+        window.sculpt_button.setChecked(True)
+        window.density_button.setChecked(True)
+
+        self._drag_a_vertex_far_away(window.mesh_panel)
+
+        assert len(window.digital_twin_package) > original_gaussians
+        # Positions must stay finite and consistent with the (larger) arrays.
+        positions = window.digital_twin_package.recompute_gaussian_positions()
+        assert positions.shape[0] == len(window.digital_twin_package)
+        assert np.all(np.isfinite(positions))
+        window.close()
+
+    def test_semantic_pick_resolver_uses_a_sidecar_when_present(self, qapp, tmp_path):
+        from src.viewer.digital_twin import load_digital_twin_package, save_digital_twin_package
+        from src.viewer.semantic_segmentation import semantic_labels_path
+
+        original = load_digital_twin_package(str(BONSAI_TWIN))
+        twin_path = tmp_path / "bonsai_digital_twin.npz"
+        save_digital_twin_package(str(twin_path), original)
+
+        n = len(original)
+        labels = np.zeros(n, dtype=np.int32)
+        labels[: n // 2] = 1
+        labels[n // 2:] = 2
+        np.save(semantic_labels_path(twin_path), labels)
+
+        window = MainWindow(initial_path=None)
+        window.show()
+        window._load_digital_twin(str(twin_path))
+        qapp.processEvents()
+
+        assert window.semantic_pick_button.isEnabled()
+        window.semantic_pick_button.setChecked(False)
+        face_with_label_1 = int(window.digital_twin_package.gaussian_face_idx[0])
+        vertex = int(window.digital_twin_package.mesh_faces[face_with_label_1][0])
+
+        assert window._resolve_semantic_pick(vertex) is None
+
+        window.semantic_pick_button.setChecked(True)
+        selection = window._resolve_semantic_pick(vertex)
+
+        assert selection is not None
+        assert selection.size > 0
+        assert vertex in selection.tolist()
+        window.close()
+
+    def test_delete_invalidates_the_semantic_labels_sidecar(self, qapp, tmp_path):
+        from src.viewer.digital_twin import load_digital_twin_package, save_digital_twin_package
+        from src.viewer.semantic_segmentation import semantic_labels_path
+
+        original = load_digital_twin_package(str(BONSAI_TWIN))
+        twin_path = tmp_path / "bonsai_digital_twin.npz"
+        save_digital_twin_package(str(twin_path), original)
+        np.save(semantic_labels_path(twin_path), np.zeros(len(original), dtype=np.int32))
+
+        window = MainWindow(initial_path=None)
+        window.show()
+        window._load_digital_twin(str(twin_path))
+        qapp.processEvents()
+        assert window.semantic_pick_button.isEnabled()
+
+        window.select_button.setChecked(True)
+        cx, cy = window.mesh_panel.canvas.size[0] / 2.0, window.mesh_panel.canvas.size[1] / 2.0
+        window.mesh_panel._select_drag_kind = "rect"
+        window.mesh_panel._select_path = [(cx - 40, cy - 40), (cx + 40, cy + 40)]
+        window.mesh_panel._select_release()
+        window._on_delete_selected()
+
+        assert window.semantic_labels is None
+        assert not window.semantic_pick_button.isEnabled()
         window.close()
